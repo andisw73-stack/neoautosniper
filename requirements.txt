@@ -2,5 +2,5 @@ aiohttp==3.9.5
 httpx==0.23.3
 python-telegram-bot==20.0
 solana==0.29.2
-solders==0.14.6
+solders>=0.14.0,<0.15.0
 base58==2.1.1
