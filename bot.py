@@ -36,15 +36,25 @@ def run_forever():
 
 if __name__ == "__main__":
     import os, time, traceback, requests
+def _to_int_env(key, default):
+    """Liest eine ENV-Variable und wandelt sie sicher in int um."""
+    import os
+    val = os.getenv(key, str(default))
+    # Entferne alle Zeichen, die keine Ziffern oder Minus sind
+    digits = "".join(ch for ch in str(val) if ch.isdigit() or ch == "-")
+    try:
+        return int(digits) if digits not in ("", "-", None) else int(default)
+    except Exception:
+        return int(default)
 
     # ---- ENV / Defaults ----
     ENDPOINT       = os.getenv("DEXS_ENDPOINT", "https://api.dexscreener.com/latest/dex/search?q=SOL")
-    SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL", "30"))
-    TIMEOUT        = int(os.getenv("HTTP_TIMEOUT", "15"))
-    CHAIN          = os.getenv("STRAT_CHAIN", "solana").lower()
+    FDV_MAX       = _to_int_env("STRAT_FDV_MAX", 400000)
+LIQ_MIN       = _to_int_env("STRAT_LIQ_MIN", 130000)
+VOL5M_MIN     = _to_int_env("STRAT_VOL5M_MIN", 20000)
+SCAN_INTERVAL = _to_int_env("SCAN_INTERVAL", 30)
+TIMEOUT       = _to_int_env("HTTP_TIMEOUT", 15)
 
-    LIQ_MIN        = int(os.getenv("STRAT_LIQ_MIN", "130000"))
-    FDV_MAX        = int(os.getenv("STRAT_FDV_MAX", "1000000"))
     VOL5M_MIN      = int(os.getenv("STRAT_VOL5M_MIN", "20000"))  # wir prüfen 5m/1h tolerant
 
     DRY_RUN        = os.getenv("DRY_RUN", "1") == "1"
