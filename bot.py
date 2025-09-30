@@ -35,36 +35,30 @@ def run_forever():
         time.sleep(interval)
 
 if __name__ == "__main__":
-    import time, signal, sys, traceback
+    import os, time, traceback, requests
 
-    running = True
-
-    def _handle(sig, frame):
-        # sauberes Herunterfahren bei Railway-Stop
-        nonlocal_running = globals().get("running")
-        print(f"[signal] received {sig}, shutting down ...", flush=True)
-        try:
-            # falls du später Ressourcen schließt, hier tun
-            pass
-        finally:
-            if nonlocal_running is not None:
-                globals()["running"] = False
-
-    # Stop-Signale abfangen (Railway sendet SIGTERM beim Stop)
-    try:
-        signal.signal(signal.SIGTERM, _handle)
-        signal.signal(signal.SIGINT, _handle)
-    except Exception:
-        pass  # manche Umgebungen erlauben das Setzen nicht
+    ENDPOINT = os.getenv("DEXS_ENDPOINT", "https://api.dexscreener.com/latest/dex/search?q=SOL")
+    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+    TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 
     print("NeoAutoSniper boot OK", flush=True)
+    print(f"Using endpoint: {ENDPOINT}", flush=True)
+
     try:
-        while running:
-            print("Heartbeat: service alive (DRY_RUN may be on).", flush=True)
-            time.sleep(30)
+        while True:
+            try:
+                r = requests.get(ENDPOINT, timeout=TIMEOUT)
+                if r.status_code == 200:
+                    j = r.json()
+                    pairs = j.get("pairs", []) or j.get("result", []) or []
+                    print(f"[SCAN] OK – {len(pairs)} pairs received", flush=True)
+                else:
+                    print(f"[SCAN] HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            except Exception as e:
+                print(f"[SCAN] ERROR: {e}", flush=True)
+                traceback.print_exc()
+
+            time.sleep(SCAN_INTERVAL)
     except Exception:
         traceback.print_exc()
-        # kurz warten, damit Logs sicher rausgehen
         time.sleep(5)
-
-
