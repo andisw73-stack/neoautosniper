@@ -1,11 +1,12 @@
-# bot.py – NeoAutoSniper (Scan + Debug)
-# Multi-Source Scan, robuste ENV, Debug-Ausgaben, 2-stufiger Filter (Chain, optional Quote)
+# bot.py – NeoAutoSniper (Scan + Debug, Solana focus)
+# Multi-Source Scan, relaxter Chain-Filter ("sol" in chainId), optional Quote=SOL
 
 import os
 import time
 import signal
 import traceback
 import requests
+from collections import Counter
 
 # ----------------------- Helpers -----------------------
 def _to_int_env(key: str, default: int) -> int:
@@ -25,7 +26,6 @@ def _to_int(val, default=0) -> int:
         if isinstance(val, (int, float)):
             return int(val)
         s = str(val).replace(",", "").strip()
-        # keep digits, minus and dot, then cast
         digits = "".join(ch for ch in s if (ch.isdigit() or ch in ".-"))
         return int(float(digits)) if digits not in ("", "-", ".", "-.", "") else default
     except Exception:
@@ -50,33 +50,38 @@ def _get_base_symbol(p) -> str:
 def _pair_id(p):
     return p.get("pairAddress") or p.get("pairId") or p.get("url")
 
-# ----------------------- ENV / Defaults -----------------------
-CHAIN            = os.getenv("STRAT_CHAIN", "solana").lower()  # wir zielen auf Solana
-QUOTE            = os.getenv("STRAT_QUOTE", "SOL").upper()     # Ziel-Quote (z.B. SOL)
-STRICT_QUOTE     = os.getenv("STRICT_QUOTE", "0") == "1"       # wenn 1 -> nur quote == QUOTE
+def _chain_of(p) -> str:
+    return (p.get("chainId") or p.get("chain") or "").lower()
 
-# Fallback-Suche (wird genutzt, wenn die Hauptquellen leer sind)
+# ----------------------- ENV / Defaults -----------------------
+CHAIN             = os.getenv("STRAT_CHAIN", "solana").lower()  # Ziel-Chain (nur Info/Logging)
+QUOTE             = os.getenv("STRAT_QUOTE", "SOL").upper()     # gewünschtes Quote-Asset
+STRICT_QUOTE      = os.getenv("STRICT_QUOTE", "0") == "1"       # 1 => zwingend QUOTE verlangen
+
+# Fallback-Suche (wenn Hauptquellen leer sind)
 ENDPOINT_FALLBACK = os.getenv("DEXS_ENDPOINT", "https://api.dexscreener.com/latest/dex/search?q=sol")
 
-SCAN_INTERVAL    = _to_int_env("SCAN_INTERVAL", 30)
-TIMEOUT          = _to_int_env("HTTP_TIMEOUT", 15)
+SCAN_INTERVAL     = _to_int_env("SCAN_INTERVAL", 30)
+TIMEOUT           = _to_int_env("HTTP_TIMEOUT", 15)
 
-# Relaxte Test-Schwellen – damit wir erst einmal Treffer sehen
-LIQ_MIN          = _to_int_env("STRAT_LIQ_MIN", 50000)     # 50k
-FDV_MAX          = _to_int_env("STRAT_FDV_MAX", 2000000)   # 2m
-VOL5M_MIN        = _to_int_env("STRAT_VOL5M_MIN", 5000)    # 5k
+# etwas entspannte Defaults zum Testen
+LIQ_MIN           = _to_int_env("STRAT_LIQ_MIN", 50000)      # 50k
+FDV_MAX           = _to_int_env("STRAT_FDV_MAX", 2000000)    # 2m
+VOL5M_MIN         = _to_int_env("STRAT_VOL5M_MIN", 5000)     # 5k
 
-DRY_RUN          = os.getenv("DRY_RUN", "1") == "1"
+DRY_RUN           = os.getenv("DRY_RUN", "1") == "1"
 
 print("NeoAutoSniper boot OK")
-print(f"Settings: chain={CHAIN} quote={QUOTE}  STRICT_QUOTE={STRICT_QUOTE}  "
-      f"LIQ_MIN={LIQ_MIN}  FDV_MAX={FDV_MAX}  VOL5M_MIN={VOL5M_MIN}  DRY_RUN={DRY_RUN}")
+print(f"Settings: chain={CHAIN} quote={QUOTE} STRICT_QUOTE={STRICT_QUOTE} "
+      f"LIQ_MIN={LIQ_MIN} FDV_MAX={FDV_MAX} VOL5M_MIN={VOL5M_MIN} DRY_RUN={DRY_RUN}")
 
 # ----------------------- Scan sources -----------------------
 SOURCES = [
-    # Dieser Endpoint kann je nach Chain 404 liefern; wir loggen das sauber
+    # dieser Endpunkt liefert für solana oft 404 – wir loggen es, schadet nicht
     lambda: f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN}",
-    # Zwei Suchen, liefern jeweils ~30 relevante Treffer
+    # gezielte Suchbegriffe, um SOL-Pools zu erwischen
+    lambda: "https://api.dexscreener.com/latest/dex/search?q=SOL/USDC",
+    lambda: "https://api.dexscreener.com/latest/dex/search?q=SOL/SOL",
     lambda: "https://api.dexscreener.com/latest/dex/search?q=SOL",
     lambda: "https://api.dexscreener.com/latest/dex/search?q=solana",
 ]
@@ -125,21 +130,23 @@ def scan_market():
 
         print(f"[SCAN] collected {len(all_pairs)} unique pairs from {raw_total} raw results ({len(SOURCES)}+fallback sources)")
 
-        # 2) Debug: zeig die ersten 5 Roh-Paare, damit wir die Felder sehen
+        # 2) Debug: zeig die ersten 8 Roh-Paare & eine Chain-Verteilung
         if all_pairs:
-            print("[DEBUG] first 5 raw pairs:")
-            for p in all_pairs[:5]:
+            print("[DEBUG] first 8 raw pairs:")
+            for p in all_pairs[:8]:
                 print("  symbol:", _get_base_symbol(p),
                       "quote:", _get_quote_symbol(p),
-                      "chain:", (p.get("chainId") or p.get("chain")),
+                      "chain:", _chain_of(p),
                       "liq:", (p.get("liquidity") or {}).get("usd"),
                       "fdv:", p.get("fdv"),
-                      "vol.m5:", (p.get("volume") or {}).get("m5"),
+                      "m5:",  (p.get("volume") or {}).get("m5"),
                       "url:", p.get("url"))
+            counts = Counter(_chain_of(p) or "unknown" for p in all_pairs)
+            print("[DEBUG] chain distribution:", dict(counts))
 
-        # 3) Filter-Stufe 1: nur unsere Chain
-        chain_only = [p for p in all_pairs if (p.get("chainId") or p.get("chain") or "").lower() == CHAIN]
-        print(f"[SCAN] after chain filter: {len(chain_only)} pairs (chain={CHAIN})")
+        # 3) Filter-Stufe 1: relaxter Chain-Filter – alles, wo chainId 'sol' enthält
+        chain_only = [p for p in all_pairs if "sol" in _chain_of(p)]
+        print(f"[SCAN] after relaxed-chain filter: {len(chain_only)} pairs (contains 'sol')")
 
         # 4) Filter-Stufe 2 (optional): nur Quote = SOL
         if STRICT_QUOTE:
@@ -159,14 +166,14 @@ def scan_market():
             if (liq >= LIQ_MIN) and (0 < fdv <= FDV_MAX) and (vol5m >= VOL5M_MIN):
                 base = _get_base_symbol(p)
                 url  = p.get("url") or ""
-                hits.append((base, liq, fdv, vol5m, url))
+                hits.append((base, liq, fdv, vol5m, url, _get_quote_symbol(p)))
 
         # 6) Ausgabe
         if hits:
             hits.sort(key=lambda x: (-x[1], x[2]))  # viel Liq, kleine FDV zuerst
             print(f"[HITS] {len(hits)} match(es) (top 5):")
-            for base, liq, fdv, v5, url in hits[:5]:
-                print(f"  • {base}/{QUOTE} | liq ${liq:,} | fdv ${fdv:,} | v5m {v5} | {url}")
+            for base, liq, fdv, v5, url, q in hits[:5]:
+                print(f"  • {base}/{q} | liq ${liq:,} | fdv ${fdv:,} | v5m {v5} | {url}")
         else:
             print("[HITS] none matching filters")
 
