@@ -35,4 +35,17 @@ def run_forever():
         time.sleep(interval)
 
 if __name__ == "__main__":
-    run_forever()
+    import time, traceback
+    print("NeoAutoSniper boot OK", flush=True)
+    try:
+        # TODO: hier später deinen eigentlichen Start aufrufen, z.B. start_scanner()
+        # vorerst nur Heartbeat, damit der Container lebt und Logs schreibt:
+        while True:
+            print("Heartbeat: service alive (DRY_RUN may be on).", flush=True)
+            time.sleep(30)
+    except Exception as e:
+        print("FATAL:", e, flush=True)
+        traceback.print_exc()
+        # etwas warten, damit der Log sichtbar bleibt
+        time.sleep(10)
+
