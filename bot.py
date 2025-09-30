@@ -35,17 +35,36 @@ def run_forever():
         time.sleep(interval)
 
 if __name__ == "__main__":
-    import time, traceback
+    import time, signal, sys, traceback
+
+    running = True
+
+    def _handle(sig, frame):
+        # sauberes Herunterfahren bei Railway-Stop
+        nonlocal_running = globals().get("running")
+        print(f"[signal] received {sig}, shutting down ...", flush=True)
+        try:
+            # falls du später Ressourcen schließt, hier tun
+            pass
+        finally:
+            if nonlocal_running is not None:
+                globals()["running"] = False
+
+    # Stop-Signale abfangen (Railway sendet SIGTERM beim Stop)
+    try:
+        signal.signal(signal.SIGTERM, _handle)
+        signal.signal(signal.SIGINT, _handle)
+    except Exception:
+        pass  # manche Umgebungen erlauben das Setzen nicht
+
     print("NeoAutoSniper boot OK", flush=True)
     try:
-        # TODO: hier später deinen eigentlichen Start aufrufen, z.B. start_scanner()
-        # vorerst nur Heartbeat, damit der Container lebt und Logs schreibt:
-        while True:
+        while running:
             print("Heartbeat: service alive (DRY_RUN may be on).", flush=True)
             time.sleep(30)
-    except Exception as e:
-        print("FATAL:", e, flush=True)
+    except Exception:
         traceback.print_exc()
-        # etwas warten, damit der Log sichtbar bleibt
-        time.sleep(10)
+        # kurz warten, damit Logs sicher rausgehen
+        time.sleep(5)
+
 
