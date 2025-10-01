@@ -1,262 +1,323 @@
-# bot.py — NeoAutoSniper (Scanner + Telegram-Menü)
-# - Scannt DexScreener nach Solana-Pairs
-# - Filtert nach deinen Settings (ENV oder zur Laufzeit via Telegram)
-# - Schickt Treffer als Telegram-Nachrichten
-# - Nutzt NUR 'requests' (keine Extra-Dependencies)
-
-import os
-import time
-import json
-import threading
-from datetime import datetime, timezone
-from typing import List, Dict, Any
-
+# bot.py
+# NeoAutoSniper – Scanner + Telegram-Bot + (optional) Trading über Jupiter
+# ---------------------------------------------------------------
+import os, time, json, math, threading, datetime as dt
+from typing import List, Dict, Any, Optional
 import requests
+
 from telegram_handlers import TelegramBot
+from trading import JupiterTrader
 
-# ---------------------- Helpers ----------------------
+API_DS = "https://api.dexscreener.com"
 
-def _as_int(val, default=0) -> int:
+# ----------------------- Konfiguration aus ENV -----------------------
+def env_int(key: str, default: int) -> int:
     try:
-        s = str(val).strip().replace("_", "").replace(",", "")
-        return int(float(s))
+        v = os.getenv(key, "").strip()
+        if not v:
+            return default
+        return int(v)
     except Exception:
-        return int(default)
+        return default
 
-def _num(d, *path, default=0.0) -> float:
-    cur = d
-    for k in path:
+def env_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
+
+STRATEGY       = os.getenv("STRATEGY", "dexscreener")
+CHAIN          = os.getenv("STRAT_CHAIN", "solana")
+STRICT_QUOTE   = env_bool("STRICT_QUOTE", False)
+STRAT_QUOTE    = os.getenv("STRAT_QUOTE", "SOL").upper()   # SOL/USDC/…
+LIQ_MIN        = env_int("STRAT_LIQ_MIN", 130000)
+FDV_MAX        = env_int("STRAT_FDV_MAX", 400000)
+VOL5M_MIN      = env_int("STRAT_VOL5M_MIN", 2000)
+VOL_BEST_MIN   = env_int("STRAT_VOL_BEST_MIN", 5000)
+MAX_AGE_MIN    = env_int("MAX_AGE_MIN", 120)
+MAX_ITEMS      = env_int("MAX_ITEMS", 200)
+
+INTERVAL       = env_int("INTERVAL", 60)
+TIMEOUT        = env_int("TIMEOUT", 15)
+
+DRY_RUN        = env_bool("DRY_RUN", True)   # True = nur simulieren
+AUTO_BUY       = env_bool("AUTO_BUY", False)
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # optional
+
+# Wallet/Trading
+RPC_URL        = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+WALLET_SECRET  = os.getenv("WALLET_SECRET", "").strip()     # base58 oder JSON-Array
+SLIPPAGE_BPS   = env_int("SLIPPAGE_BPS", 50)                # 0.5%
+DEFAULT_BUY_SOL= float(os.getenv("DEFAULT_BUY_SOL", "0.05"))# Standard-Kaufsumme
+
+# ----------------------- Util -----------------------
+def now() -> str:
+    return dt.datetime.utcnow().strftime("%H:%M:%S")
+
+def mins_ago(ts_ms: Optional[int]) -> Optional[int]:
+    if not ts_ms:
+        return None
+    return int((time.time()*1000 - ts_ms) / 60000)
+
+def summarize_settings() -> str:
+    return (
+        f"• Strategy: {STRATEGY} | Chain: {CHAIN} | Quote: {STRAT_QUOTE} (STRICT={1 if STRICT_QUOTE else 0})\n"
+        f"• LIQ_MIN: {LIQ_MIN:,} | FDV_MAX: {FDV_MAX:,}\n"
+        f"• VOL5M_MIN: {VOL5M_MIN:,} | VOL_BEST_MIN: {VOL_BEST_MIN:,}\n"
+        f"• MAX_AGE_MIN: {MAX_AGE_MIN} | MAX_ITEMS: {MAX_ITEMS}\n"
+        f"• DRY_RUN: {1 if DRY_RUN else 0} | AUTO_BUY: {1 if AUTO_BUY else 0}\n"
+        f"• INTERVAL: {INTERVAL}s | TIMEOUT: {TIMEOUT}s"
+    )
+
+# ----------------------- Dexscreener: Scannen -----------------------
+def ds_search_batches() -> List[Dict[str, Any]]:
+    """
+    DexScreener liefert /latest/dex/pairs/solana häufig 404.
+    Daher mehrere Search-Queries als Fallback mixen.
+    """
+    queries = ["solana", "SOL", "SOL/USDC", "USDC/SOL"]
+    pairs: Dict[str, Dict[str, Any]] = {}
+    for q in queries:
+        try:
+            url = f"{API_DS}/latest/dex/search?q={q}"
+            r = requests.get(url, timeout=TIMEOUT)
+            if r.status_code != 200:
+                print(f"[{now()}] [SCAN] {url} -> HTTP {r.status_code}")
+                continue
+            data = r.json().get("pairs", []) or []
+            for p in data:
+                # Use pairAddress as unique key if available else url
+                key = p.get("pairAddress") or p.get("url")
+                if not key:
+                    key = json.dumps(p, sort_keys=True)[:64]
+                pairs[key] = p
+        except Exception as e:
+            print(f"[{now()}] [SCAN] ERR search {q}: {e}")
+    uniq = list(pairs.values())
+    print(f"[{now()}] [SCAN] collected {len(uniq)} unique pairs from {len(uniq)} raw results (3+fallback sources)")
+    return uniq
+
+def keep_chain(p: Dict[str, Any]) -> bool:
+    chain_id = p.get("chainId") or p.get("chain") or ""
+    # Viele Einträge haben chainId='solana'
+    if chain_id.lower() == "solana":
+        return True
+    # Fallback: URL enthält '/solana/'
+    url = (p.get("url") or "").lower()
+    return "/solana/" in url
+
+def keep_quote(p: Dict[str, Any]) -> bool:
+    if not STRICT_QUOTE:
+        return True
+    qsym = (p.get("quoteToken", {}).get("symbol") or p.get("quoteSymbol") or "").upper()
+    return qsym == STRAT_QUOTE
+
+def metric_num(obj, *keys) -> float:
+    cur = obj
+    for k in keys:
         if not isinstance(cur, dict) or k not in cur:
-            return float(default)
+            return 0.0
         cur = cur[k]
     try:
         return float(cur)
     except Exception:
-        return float(default)
+        return 0.0
 
-def _best_vol(p: Dict[str, Any]) -> int:
-    v = p.get("volume") or {}
-    m5  = _as_int(v.get("m5", 0))
-    m15 = _as_int(v.get("m15", 0))
-    h1  = _as_int(v.get("h1", 0))
-    return max(m5, m15, h1)
+def keep_metrics(p: Dict[str, Any]) -> bool:
+    liq = metric_num(p, "liquidity", "usd")
+    fdv = metric_num(p, "fdv")
+    vol5 = metric_num(p, "volume", "m5") or metric_num(p, "volume", "h5")  # manche liefern h5 statt m5
+    best_vol = max(
+        metric_num(p, "volume", "m5"),
+        metric_num(p, "volume", "h1"),
+        metric_num(p, "volume", "h6"),
+        metric_num(p, "volume", "h24"),
+        0.0,
+    )
+    age_min = mins_ago(p.get("pairCreatedAt"))
 
-def _age_minutes(p: Dict[str, Any]) -> int:
-    ts = p.get("pairCreatedAt")
-    try:
-        if ts is None:
-            return 10**9
-        # Dexscreener liefert ms seit Epoch
-        dt = datetime.fromtimestamp(int(ts) / 1000.0, tz=timezone.utc)
-        return int((datetime.now(timezone.utc) - dt).total_seconds() // 60)
-    except Exception:
-        return 10**9
+    if liq < LIQ_MIN: return False
+    if fdv and fdv > FDV_MAX: return False
+    if VOL5M_MIN and vol5 < VOL5M_MIN: return False
+    if VOL_BEST_MIN and best_vol < VOL_BEST_MIN: return False
+    if MAX_AGE_MIN and (age_min is not None) and age_min > MAX_AGE_MIN: return False
+    return True
 
-def _fmt_pair(p, liq, fdv, vol5, bestv) -> str:
-    base  = (p.get("baseToken") or {}).get("symbol") or "?"
-    quote = (p.get("quoteToken") or {}).get("symbol") or "?"
+def format_hit(p: Dict[str, Any]) -> str:
+    base = p.get("baseToken", {}).get("symbol") or p.get("baseSymbol") or "?"
+    quote = p.get("quoteToken", {}).get("symbol") or p.get("quoteSymbol") or "?"
     url   = p.get("url") or ""
-    ageM  = _age_minutes(p)
-    return f"• <b>{base}/{quote}</b> | liq ${liq:,.0f} | fdv ${fdv:,.0f} | vol5 {int(vol5):,} | best {bestv:,} | age {ageM}m | {url}"
+    liq   = metric_num(p, "liquidity", "usd")
+    fdv   = metric_num(p, "fdv")
+    v5    = metric_num(p, "volume", "m5") or metric_num(p, "volume", "h5")
+    age   = mins_ago(p.get("pairCreatedAt"))
+    return f"{base}/{quote} | liq ${liq:,.0f} | fdv ${fdv:,.0f} | vol* {int(v5):,} | age {age}m | {url}"
 
-# ---------------------- Konfiguration ----------------------
-
-CONFIG: Dict[str, Any] = {
-    "STRATEGY":          os.getenv("STRATEGY", "dexscreener"),
-    "STRAT_CHAIN":       os.getenv("STRAT_CHAIN", "solana").lower(),
-    "STRAT_QUOTE":       os.getenv("STRAT_QUOTE", "SOL").upper(),
-    "STRICT_QUOTE":      _as_int(os.getenv("STRICT_QUOTE", "0"), 0),   # 1 = nur diese Quote
-    "SCAN_INTERVAL":     _as_int(os.getenv("SCAN_INTERVAL", "60"), 60),
-    "HTTP_TIMEOUT":      _as_int(os.getenv("HTTP_TIMEOUT", "15"), 15),
-    "STRAT_MAX_ITEMS":   _as_int(os.getenv("STRAT_MAX_ITEMS", "200"), 200),
-
-    "STRAT_LIQ_MIN":     _as_int(os.getenv("STRAT_LIQ_MIN", "130000"), 130000),
-    "STRAT_FDV_MAX":     _as_int(os.getenv("STRAT_FDV_MAX", "400000"), 400000),
-    "STRAT_VOL5M_MIN":   _as_int(os.getenv("STRAT_VOL5M_MIN", "20000"), 20000),
-    "STRAT_VOL_BEST_MIN":_as_int(os.getenv("STRAT_VOL_BEST_MIN", "0"), 0),  # 0 = ignorieren
-    "MAX_AGE_MIN":       _as_int(os.getenv("MAX_AGE_MIN", "0"), 0),         # 0 = kein Altersfilter
-
-    "DRY_RUN":           _as_int(os.getenv("DRY_RUN", "1"), 1),
-    "AUTO_BUY":          _as_int(os.getenv("AUTO_BUY", "0"), 0),            # (nur Platzhalter)
-}
-
-def settings_text() -> str:
-    return (
-        "<b>NeoAutoSniper Status</b>\n"
-        f"• Strategy: {CONFIG['STRATEGY']} | Chain: {CONFIG['STRAT_CHAIN']} | Quote: {CONFIG['STRAT_QUOTE']} (STRICT={CONFIG['STRICT_QUOTE']})\n"
-        f"• LIQ_MIN: {CONFIG['STRAT_LIQ_MIN']:,} | FDV_MAX: {CONFIG['STRAT_FDV_MAX']:,}\n"
-        f"• VOL5M_MIN: {CONFIG['STRAT_VOL5M_MIN']:,} | VOL_BEST_MIN: {CONFIG['STRAT_VOL_BEST_MIN']:,}\n"
-        f"• MAX_AGE_MIN: {CONFIG['MAX_AGE_MIN']} | MAX_ITEMS: {CONFIG['STRAT_MAX_ITEMS']}\n"
-        f"• DRY_RUN: {CONFIG['DRY_RUN']} | AUTO_BUY: {CONFIG['AUTO_BUY']}\n"
-        f"• INTERVAL: {CONFIG['SCAN_INTERVAL']}s | TIMEOUT: {CONFIG['HTTP_TIMEOUT']}s\n"
-    )
-
-# ---------------------- Telegram Setup ----------------------
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip() or None  # kann leer sein -> Auto-Learn
-tg = None
-_force_scan = threading.Event()
-
-def start_telegram():
-    global tg
-    if not TELEGRAM_BOT_TOKEN:
-        print("[TG] Kein TELEGRAM_BOT_TOKEN – Telegram deaktiviert.")
-        return
-    chat_id_int = int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None
-    tg = TelegramBot(
-        token=TELEGRAM_BOT_TOKEN,
-        chat_id=chat_id_int,
-        config=CONFIG,
-        on_refresh=lambda: _force_scan.set(),
-    )
-    threading.Thread(target=tg.poll_forever, daemon=True).start()
-    tg.send_text("🚀 NeoAutoSniper boot OK.\n" + settings_text())
-
-# ---------------------- DexScreener Scan ----------------------
-
-def _http_get(url: str, params=None, timeout=15):
-    try:
-        return requests.get(url, params=params or {}, timeout=timeout)
-    except Exception:
-        return None
-
-def fetch_pairs() -> List[Dict[str, Any]]:
-    chain = CONFIG["STRAT_CHAIN"]
-    timeout = CONFIG["HTTP_TIMEOUT"]
-    sources = [
-        f"https://api.dexscreener.com/latest/dex/pairs/{chain}",                 # kann 404 sein
-        "https://api.dexscreener.com/latest/dex/search?q=solana",
-        "https://api.dexscreener.com/latest/dex/search?q=SOL",
-        "https://api.dexscreener.com/latest/dex/search?q=SOL/USDC",
-        "https://api.dexscreener.com/latest/dex/search?q=SOL/SOL",
-    ]
-    uniq = {}
-    raw_count = 0
-    for url in sources:
-        r = _http_get(url, timeout=timeout)
-        if not r or r.status_code != 200:
-            print(f"[SCAN] {url} -> {r.status_code if r else 'ERR'}")
-            continue
-        data = r.json() or {}
-        arr = data.get("pairs") or data.get("result") or []
-        raw_count += len(arr)
-        for p in arr:
-            pid = p.get("pairAddress") or p.get("url")
-            if not pid:
-                continue
-            if pid not in uniq:
-                uniq[pid] = p
-        # sanfte Drosselung
-        time.sleep(0.2)
-        if len(uniq) >= CONFIG["STRAT_MAX_ITEMS"]:
-            break
-
-    pairs = list(uniq.values())
-    print(f"[SCAN] collected {len(pairs)} unique pairs from {raw_count} raw results ({len(sources)} sources)")
-    return pairs
-
-def filter_pairs(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    chain = CONFIG["STRAT_CHAIN"]
-    strict_q = CONFIG["STRICT_QUOTE"] == 1
-    quote = CONFIG["STRAT_QUOTE"].upper()
-
-    # 1) nur Solana
-    sol = [p for p in pairs if (p.get("chainId") or "").lower() == chain]
-    if not sol:
-        # Fallback, falls chainId anders gemeldet wird
-        sol = [p for p in pairs if "sol" in (p.get("chainId") or "").lower()]
-    print(f"[SCAN] after chain filter: {len(sol)} pairs (target='{chain}')")
-
-    # 2) Quote-Filter
-    if strict_q and quote != "ANY":
-        sol = [p for p in sol if ((p.get("quoteToken") or {}).get("symbol") or "").upper() == quote]
-        print(f"[SCAN] after quote filter: {len(sol)} pairs (quote={quote})")
+def scan() -> List[Dict[str, Any]]:
+    raw = ds_search_batches()
+    raw = [p for p in raw if keep_chain(p)]
+    print(f"[{now()}] [SCAN] after relaxed-chain filter: {len(raw)} pairs (contains 'sol')")
+    if STRICT_QUOTE:
+        raw = [p for p in raw if keep_quote(p)]
+        print(f"[{now()}] [SCAN] quote filter enabled (STRICT_QUOTE=1) -> using {len(raw)} pairs")
     else:
-        print(f"[SCAN] quote filter disabled (STRICT_QUOTE={CONFIG['STRICT_QUOTE']}) -> using {len(sol)} pairs")
+        print(f"[{now()}] [SCAN] quote filter disabled (STRICT_QUOTE=0) -> using {len(raw)} pairs")
 
-    # 3) Alters-Filter
-    if CONFIG["MAX_AGE_MIN"] > 0:
-        sol = [p for p in sol if _age_minutes(p) <= CONFIG["MAX_AGE_MIN"]]
-        print(f"[SCAN] after age filter: {len(sol)} pairs (≤ {CONFIG['MAX_AGE_MIN']}m)")
+    hits = [p for p in raw if keep_metrics(p)]
+    hits.sort(key=lambda x: (metric_num(x, "liquidity", "usd"), metric_num(x, "volume", "h24")), reverse=True)
+    return hits[:MAX_ITEMS]
 
-    return sol
+# ----------------------- Telegram + Trading Layer -----------------------
+class App:
+    def __init__(self):
+        self.trader = JupiterTrader(rpc_url=RPC_URL, wallet_secret=WALLET_SECRET, slippage_bps=SLIPPAGE_BPS)
+        self.bot = None  # type: Optional[TelegramBot]
+        if TELEGRAM_TOKEN:
+            self.bot = TelegramBot(
+                token=TELEGRAM_TOKEN,
+                fixed_chat_id=TELEGRAM_CHAT or None,
+                on_command=self._on_command,
+                on_button=self._on_button
+            )
+            # Startet Long-Polling in Thread
+            self.bot.start()
+            # Status bei Start
+            self.bot.safe_broadcast(f"🚀 NeoAutoSniper boot OK.\n<b>NeoAutoSniper Status</b>\n{summarize_settings()}", parse_mode="HTML")
+        else:
+            print(f"[{now()}] [TG] Kein TELEGRAM_BOT_TOKEN – Telegram deaktiviert.")
 
-def apply_strategy(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    liq_min   = CONFIG["STRAT_LIQ_MIN"]
-    fdv_max   = CONFIG["STRAT_FDV_MAX"]
-    vol5_min  = CONFIG["STRAT_VOL5M_MIN"]
-    best_min  = CONFIG["STRAT_VOL_BEST_MIN"]
+    # ---------- Telegram Callbacks ----------
+    def _on_button(self, chat_id: int, text: str):
+        t = text.strip().lower()
+        if t == "refresh":
+            self._send_scan(chat_id)
+        elif t == "settings":
+            self.bot.safe_send(chat_id, f"Aktuelle Settings:\n{summarize_settings()}")
+        elif t == "wallet":
+            msg = self.trader.describe_wallet()
+            self.bot.safe_send(chat_id, msg, disable_web_page_preview=True)
+        elif t == "buy":
+            self.bot.safe_send(chat_id, "Format: /buy <MINT> <SOL>\nBeispiel: <code>/buy 9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E 0.05</code>", parse_mode="HTML")
+        elif t == "fund":
+            self.bot.safe_send(chat_id, f"Einzahlungs-Adresse (SOL): <code>{self.trader.public_key or '—'}</code>", parse_mode="HTML")
+        else:
+            self.bot.safe_send(chat_id, "Platzhalter.")
 
-    for p in pairs:
-        liq   = _num(p, "liquidity", "usd")
-        fdv   = _num(p, "fdv")
-        vol5  = _num(p, "volume", "m5")
-        bestv = _best_vol(p)
+    def _on_command(self, chat_id: int, cmd: str, args: List[str]):
+        c = cmd.lower()
+        if c == "/start":
+            self.bot.send_keyboard(chat_id)
+            self.bot.safe_send(chat_id, f"🤖 NeoAutoSniper ist bereit.\nNutze /help für alle Befehle oder die Tasten unten.")
+            return
+        if c == "/help":
+            self.bot.safe_send(chat_id,
+                "Befehle:\n"
+                "• /set liq <USD> | /set fdv <USD> | /set vol5m <USD>\n"
+                "• /set quote <SYM> (z.B. SOL) | /strict 0|1\n"
+                "• /dryrun on|off | /interval <sec>\n"
+                "• /buy <MINT> <SOL>  – kauft via Jupiter\n"
+                "• /sell <MINT> <MENGE|%> – verkauft Token -> SOL\n"
+                "• Refresh – sofort scannen\n"
+            )
+            return
+        if c == "/set" and len(args) >= 2:
+            key, val = args[0].lower(), args[1]
+            global LIQ_MIN, FDV_MAX, VOL5M_MIN, STRAT_QUOTE
+            try:
+                if key == "liq":
+                    LIQ_MIN = int(val)
+                elif key == "fdv":
+                    FDV_MAX = int(val)
+                elif key == "vol5m":
+                    VOL5M_MIN = int(val)
+                elif key == "quote":
+                    STRAT_QUOTE = val.upper()
+                self.bot.safe_send(chat_id, "OK. " + summarize_settings())
+            except Exception as e:
+                self.bot.safe_send(chat_id, f"Fehler: {e}")
+            return
+        if c == "/strict" and len(args) == 1:
+            global STRICT_QUOTE
+            STRICT_QUOTE = args[0] in ("1","true","on","yes")
+            self.bot.safe_send(chat_id, "OK. " + summarize_settings())
+            return
+        if c == "/dryrun" and len(args) == 1:
+            global DRY_RUN
+            DRY_RUN = args[0] in ("1","true","on","yes")
+            self.bot.safe_send(chat_id, "OK. " + summarize_settings())
+            return
+        if c == "/interval" and len(args) == 1:
+            global INTERVAL
+            try:
+                INTERVAL = max(10, int(args[0]))
+                self.bot.safe_send(chat_id, "OK. " + summarize_settings())
+            except:
+                self.bot.safe_send(chat_id, "Ungültiger Wert.")
+            return
+        if c == "/buy" and len(args) >= 1:
+            mint = args[0]
+            sol_amt = float(args[1]) if len(args) >= 2 else DEFAULT_BUY_SOL
+            if DRY_RUN:
+                self.bot.safe_send(chat_id, f"🧪 DRY_RUN – würde kaufen: {sol_amt} SOL -> {mint}")
+                return
+            res = self.trader.buy_with_sol(mint, sol_amt)
+            self.bot.safe_send(chat_id, res, disable_web_page_preview=True)
+            return
+        if c == "/sell" and len(args) >= 2:
+            mint = args[0]; qty = args[1]
+            if DRY_RUN:
+                self.bot.safe_send(chat_id, f"🧪 DRY_RUN – würde verkaufen: {qty} {mint} -> SOL")
+                return
+            res = self.trader.sell_to_sol(mint, qty)
+            self.bot.safe_send(chat_id, res, disable_web_page_preview=True)
+            return
 
-        if liq < liq_min:
-            continue
-        if not (0 < fdv <= fdv_max):
-            continue
-        if vol5 < vol5_min:
-            continue
-        if best_min > 0 and bestv < best_min:
-            continue
+        self.bot.safe_send(chat_id, "Unbekannter Befehl. /help")
 
-        out.append((p, liq, fdv, vol5, bestv))
-
-    # sortieren: viel Liq, kleiner FDV, hohes bestVol
-    out.sort(key=lambda t: (-t[1], t[2], -t[4]))
-    return out
-
-# ---------------------- Main Loop ----------------------
-
-def main():
-    print("Starting NeoAutoSniper…")
-    print(settings_text())
-
-    # Telegram starten (optional)
-    start_telegram()
-
-    last_scan = 0.0
-    while True:
-        try:
-            # Sofort-Scan vom Telegram-Button 'Refresh'
-            if _force_scan.is_set():
-                _force_scan.clear()
-                last_scan = 0.0
-
-            now = time.time()
-            if now - last_scan < max(5, CONFIG["SCAN_INTERVAL"]):
-                time.sleep(1)
-                continue
-            last_scan = now
-
-            raw = fetch_pairs()
-            pool = filter_pairs(raw)
-            hits = apply_strategy(pool)
-            top  = hits[:5]
-
-            if top:
-                rows = []
-                for p, liq, fdv, vol5, bestv in top:
-                    rows.append(_fmt_pair(p, liq, fdv, vol5, bestv))
-                if tg:
-                    if CONFIG["DRY_RUN"] == 1:
-                        rows.append("\n[MODE] DRY_RUN aktiv – keine Käufe.")
-                    tg.send_hits("Treffer (Top 5)", rows)
-                else:
-                    print("[HITS]", len(top))
+    # ---------- Scan + Alerts ----------
+    def _send_scan(self, chat_id: Optional[int] = None):
+        hits = scan()
+        if not hits:
+            msg = "✅ [HITS] keine Treffer im aktuellen Scan."
+            if self.bot:
+                if chat_id: self.bot.safe_send(chat_id, msg)
+                else: self.bot.safe_broadcast(msg)
             else:
-                if tg:
-                    tg.send_text("✅ [HITS] keine Treffer im aktuellen Scan.")
-                else:
-                    print("[HITS] none")
+                print(msg)
+            return
 
-        except Exception as e:
-            print("[ERR]", e)
-            time.sleep(2)
+        # Nachricht bauen
+        top_lines = []
+        for p in hits[:5]:
+            top_lines.append("• " + format_hit(p))
+        text = "🎯 Treffer (Top 5):\n" + "\n".join(top_lines)
+        if self.bot:
+            if chat_id: self.bot.safe_send(chat_id, text, disable_web_page_preview=False)
+            else: self.bot.safe_broadcast(text, disable_web_page_preview=False)
+        else:
+            print(text)
+
+        # Auto-Buy (optional)
+        if (not DRY_RUN) and AUTO_BUY and len(hits) > 0:
+            best = hits[0]
+            base_mint = (best.get("baseToken") or {}).get("address")
+            if base_mint:
+                res = self.trader.buy_with_sol(base_mint, DEFAULT_BUY_SOL)
+                if self.bot: self.bot.safe_broadcast(res)
+
+    def run(self):
+        print(f"[{now()}] Starting NeoAutoSniper…")
+        if self.bot:
+            self.bot.safe_broadcast(f"<b>NeoAutoSniper Status</b>\n{summarize_settings()}", parse_mode="HTML")
+
+        while True:
+            try:
+                self._send_scan()
+            except Exception as e:
+                print(f"[{now()}] Scan-Fehler: {e}")
+            time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    App().run()
