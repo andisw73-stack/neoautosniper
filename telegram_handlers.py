@@ -1,129 +1,184 @@
-# telegram_handlers.py – Mini-Version mit Menü & Settings
-import os, json, time, threading, requests
+# telegram_handlers.py
+# Long-Polling Telegram Client (nur 'requests')
+import os
+import json
+import time
+import threading
+import requests
 
-TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-ALLOW = {x.strip() for x in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if x.strip()}
-STATE_FILE = os.getenv("STATE_FILE", "/data/runtime_state.json")
-API = f"https://api.telegram.org/bot{TOKEN}"
+TG_API_TIMEOUT = 60
 
-DEFAULTS = {
-    "DRY_RUN": True,
-    "AUTO_BUY": False,
-    "STRAT_LIQ_MIN": 130000,
-    "STRAT_FDV_MAX": 400000,
-    "STRAT_VOL5M_MIN": 20000,
-    "STRAT_QUOTE": "SOL",
-    "STRICT_QUOTE": 1,
-    "MAX_BUY_USD": 50,
-}
+def _j(o):
+    return json.dumps(o, ensure_ascii=False)
 
-def load_state():
-    try:
-        with open(STATE_FILE,"r") as f: s=json.load(f)
-    except: s={}
-    for k,v in DEFAULTS.items(): s.setdefault(k,v)
-    return s
+class TelegramBot:
+    """
+    Minimaler Telegram-Client mit Long-Polling.
+    - send_message(...) für Outbound
+    - poll_loop(...) um /start, /help, /status, /set, /dryrun, "Refresh" zu verarbeiten
+    """
+    def __init__(self, token: str, chat_id: int | None = None, allowed_user: int | None = None):
+        if not token:
+            raise ValueError("TELEGRAM_BOT_TOKEN fehlt.")
+        self.api = f"https://api.telegram.org/bot{token}"
+        self.chat_id = int(chat_id) if chat_id else None
+        self.allowed_user = int(allowed_user) if allowed_user else None
+        # Falls Chat-ID beim ersten Kontakt gelernt werden soll:
+        self._learn_file = "/mnt/data/telegram_chat.json"  # survives restarts in this container session
+        self._load_chat_from_disk()
+        self._offset = 0
+        self._stop = threading.Event()
 
-def save_state(s):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE,"w") as f: json.dump(s,f,indent=2,sort_keys=True)
-    # sofort im Prozess wirksam machen:
-    for k,v in s.items(): os.environ[k]=str(v)
-
-def send(chat_id,text,keyboard=None):
-    payload={"chat_id":chat_id,"text":text,"parse_mode":"Markdown"}
-    if keyboard: payload["reply_markup"]=keyboard
-    try: requests.post(f"{API}/sendMessage", json=payload, timeout=15)
-    except: pass
-
-def kb(rows):
-    return {"keyboard":rows,"resize_keyboard":True,"one_time_keyboard":False,"is_persistent":True}
-
-MAIN = kb([
-    ["Buy","Fund"],
-    ["Help","Refer Friends","Alerts"],
-    ["Wallet","Settings"],
-    ["DCA Orders","Limit Orders"],
-    ["[ nighthawk ]","Refresh"],
-])
-
-SET = kb([
-    ["DryRun ON","DryRun OFF","AutoBuy ON","AutoBuy OFF"],
-    ["Quote SOL","Quote USDC","Quote ANY","StrictQuote TOGGLE"],
-    ["LIQ 80k","LIQ 130k","LIQ 200k"],
-    ["FDV 200k","FDV 400k","FDV 1M"],
-    ["VOL5 5k","VOL5 10k","VOL5 20k"],
-    ["MaxBuy $25","MaxBuy $50","MaxBuy $100"],
-    ["Back"],
-])
-
-def status(s):
-    return (
-        "*NeoAutoSniper*\n"
-        f"• DRY_RUN `{s['DRY_RUN']}`  • AUTO_BUY `{s['AUTO_BUY']}`\n"
-        f"• QUOTE `{s['STRAT_QUOTE']}`  • STRICT `{s['STRICT_QUOTE']}`\n"
-        f"• LIQ_MIN `${s['STRAT_LIQ_MIN']:,}`  • FDV_MAX `${s['STRAT_FDV_MAX']:,}`\n"
-        f"• VOL5M_MIN `${s['STRAT_VOL5M_MIN']:,}`  • MAX_BUY `${s['MAX_BUY_USD']}`"
-    )
-
-def handle(chat_id, txt, s):
-    t = (txt or "").strip().lower()
-    if t in ("/start","/menu","menu","start"):
-        send(chat_id,"Hauptmenü:", MAIN); send(chat_id,status(s)); return
-    if t=="refresh": send(chat_id,status(s), MAIN); return
-    if t=="help": send(chat_id,"Tippe *Settings* für Schalter & Presets.", MAIN); return
-    if t=="settings": send(chat_id,"*Settings* – wähle:", SET); return
-    if t=="back": send(chat_id,"Zurück.", MAIN); return
-
-    changed=False
-    if t=="dryrun on": s["DRY_RUN"]=True; changed=True
-    elif t=="dryrun off": s["DRY_RUN"]=False; changed=True
-    elif t=="autobuy on": s["AUTO_BUY"]=True; changed=True
-    elif t=="autobuy off": s["AUTO_BUY"]=False; changed=True
-    elif t.startswith("quote "):
-        q=t.split(" ",1)[1].upper()
-        if q in ("SOL","USDC","ANY"): s["STRAT_QUOTE"]=q; changed=True
-    elif t=="strictquote toggle":
-        s["STRICT_QUOTE"]=0 if int(s.get("STRICT_QUOTE",1))==1 else 1; changed=True
-    elif t.startswith("liq "):
-        s["STRAT_LIQ_MIN"]=int(t.split(" ",1)[1].replace("k","000")); changed=True
-    elif t.startswith("fdv "):
-        v=t.split(" ",1)[1]; s["STRAT_FDV_MAX"]=int(float(v[:-1])*1_000_000) if v.endswith("m") else int(v.replace("k","000")); changed=True
-    elif t.startswith("vol5 "):
-        s["STRAT_VOL5M_MIN"]=int(t.split(" ",1)[1].replace("k","000")); changed=True
-    elif t.startswith("maxbuy $"):
-        s["MAX_BUY_USD"]=int(t.replace("maxbuy $","")); changed=True
-    else:
-        # Platzhalter
-        if t in ("buy","fund","wallet","dca orders","limit orders","refer friends","alerts","[ nighthawk ]"):
-            send(chat_id,f"`{txt}` – Placeholder (UI steht).", MAIN); return
-        send(chat_id,"Unbekannt. `/menu` öffnet das Menü.", MAIN); return
-
-    if changed:
-        save_state(s)
-        send(chat_id, "✅ *Gespeichert*\n"+status(s), SET)
-
-def loop():
-    if not TOKEN or not ALLOW: print("[TG] disabled"); return
-    s=load_state(); save_state(s)
-    off=None
-    for cid in ALLOW:
-        try: send(int(cid),"NeoAutoSniper bereit. Tippe /menu.", MAIN)
-        except: pass
-    while True:
+    # ---------- persistence für auto-learn ----------
+    def _load_chat_from_disk(self):
         try:
-            p={"timeout":50}
-            if off is not None: p["offset"]=off
-            r=requests.get(f"{API}/getUpdates", params=p, timeout=55).json()
-            for u in r.get("result",[]):
-                off=u["update_id"]+1
-                m=u.get("message") or u.get("edited_message"); 
-                if not m or "text" not in m: continue
-                cid=m["chat"]["id"]
-                if str(cid) not in ALLOW: continue
-                handle(cid, m["text"], s)
-        except Exception as e:
-            print("[TG] loop error:", e); time.sleep(2)
+            with open(self._learn_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.chat_id = self.chat_id or data.get("chat_id")
+                self.allowed_user = self.allowed_user or data.get("allowed_user")
+        except Exception:
+            pass
 
-def start_background_polling():
-    threading.Thread(target=loop, daemon=True).start()
+    def _save_chat_to_disk(self):
+        try:
+            with open(self._learn_file, "w", encoding="utf-8") as f:
+                json.dump({"chat_id": self.chat_id, "allowed_user": self.allowed_user}, f)
+        except Exception:
+            pass
+
+    # ---------- outbound ----------
+    def send_message(self, text: str, show_menu: bool = False, disable_web_page_preview: bool = True):
+        if not self.chat_id:
+            return  # niemand gebunden -> später nochmal probieren, sobald Chat kommt
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": disable_web_page_preview
+        }
+        if show_menu:
+            payload["reply_markup"] = _j(self._main_keyboard())
+        try:
+            requests.post(f"{self.api}/sendMessage", data=payload, timeout=10)
+        except Exception:
+            pass
+
+    def _main_keyboard(self):
+        # schlichtes Menü – anpassbar
+        return {
+            "keyboard": [
+                [{"text": "Buy"}, {"text": "Fund"}],
+                [{"text": "Help"}, {"text": "Alerts"}],
+                [{"text": "Wallet"}, {"text": "Settings"}],
+                [{"text": "DCA Orders"}, {"text": "Limit Orders"}],
+                [{"text": "Refresh"}],
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False
+        }
+
+    # ---------- inbound (Long-Polling) ----------
+    def stop(self):
+        self._stop.set()
+
+    def poll_loop(self, callbacks: dict):
+        """
+        callbacks:
+          - get_status(): str
+          - set_param(key:str, value:int|str): str  -> Rückmeldungstext
+          - set_dry_run(flag:bool): str
+          - refresh(): str|None
+        """
+        while not self._stop.is_set():
+            try:
+                r = requests.get(
+                    f"{self.api}/getUpdates",
+                    params={"timeout": 50, "offset": self._offset + 1},
+                    timeout=TG_API_TIMEOUT,
+                )
+                data = r.json() if r.ok else {}
+                for upd in data.get("result", []):
+                    self._offset = upd.get("update_id", self._offset)
+                    msg = upd.get("message") or upd.get("edited_message")
+                    if not msg:
+                        continue
+                    chat = msg.get("chat", {})
+                    chat_id = chat.get("id")
+                    text = (msg.get("text") or "").strip()
+
+                    # Erstkontakt: erlaubten User & chat_id lernen
+                    if self.allowed_user is None:
+                        self.allowed_user = chat_id
+                        self.chat_id = chat_id
+                        self._save_chat_to_disk()
+                        self.send_message("🔐 Chat verknüpft. Nur diese Chat-ID darf Befehle senden.", show_menu=True)
+
+                    if chat_id != self.allowed_user:
+                        # Ignoriere fremde Chats
+                        continue
+
+                    self.chat_id = chat_id  # sicherstellen
+
+                    self._handle_text(text, callbacks)
+            except requests.RequestException:
+                time.sleep(2)
+            except Exception:
+                time.sleep(2)
+
+    # ---------- parsing ----------
+    def _handle_text(self, text: str, cb: dict):
+        t = text.lower()
+        if t in ("/start", "start", "menu", "menü"):
+            self.send_message(
+                "🤖 <b>NeoAutoSniper</b> ist bereit.\n"
+                "Nutze /help für alle Befehle oder die Tasten unten.",
+                show_menu=True)
+            return
+
+        if t in ("/help", "help"):
+            self.send_message(
+                "<b>Befehle</b>\n"
+                "• /status – aktuelle Limits & Modus\n"
+                "• /set liq 130000 – Min-Liquidität setzen\n"
+                "• /set fdv 400000 – Max-FDV setzen\n"
+                "• /set vol5m 20000 – Min 5-Min-Volumen setzen\n"
+                "• /dryrun on|off – Käufe simulieren/aktivieren\n"
+                "• Refresh – sofort scannen\n",
+                show_menu=True)
+            return
+
+        if t in ("/status", "status", "settings"):
+            s = cb.get("get_status", lambda: "n/a")()
+            self.send_message(s, show_menu=True)
+            return
+
+        if t.startswith("/set "):
+            parts = t.split()
+            if len(parts) == 3:
+                key = parts[1]
+                val = parts[2]
+                resp = cb.get("set_param", lambda *_: "Unbekannter Setter.")(key, val)
+                self.send_message(resp, show_menu=False)
+                return
+            else:
+                self.send_message("❌ Format: /set <liq|fdv|vol5m> <zahl>", show_menu=False)
+                return
+
+        if t.startswith("/dryrun"):
+            flag = "on" in t or "true" in t
+            resp = cb.get("set_dry_run", lambda *_: "n/a")(flag)
+            self.send_message(resp)
+            return
+
+        if t == "refresh":
+            resp = cb.get("refresh", lambda: None)()
+            self.send_message(resp or "🔄 Scan wird ausgeführt…")
+            return
+
+        # Platzhalter für die anderen Tasten:
+        if t in ("buy", "fund", "alerts", "wallet", "dca orders", "limit orders", "help"):
+            self.send_message("ℹ️ Diese Funktion ist als Platzhalter angelegt.", show_menu=True)
+            return
+
+        # Fallback
+        self.send_message("❓ Befehl unbekannt. /help", show_menu=True)
