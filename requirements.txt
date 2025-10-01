@@ -2,6 +2,4 @@ requests==2.31.0
 python-dotenv==1.0.1
 pytz==2024.1
 simplejson==3.19.2
-
 solana==0.30.2
-solders==0.18.2
