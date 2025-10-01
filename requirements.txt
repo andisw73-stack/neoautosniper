@@ -1,1 +1,5 @@
-requests>=2.31.0
+requests==2.32.3
+# Für Wallet/Trading:
+solana==0.30.2
+solders==0.21.0
+base58==2.1.1
