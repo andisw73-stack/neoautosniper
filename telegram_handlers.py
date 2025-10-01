@@ -1,184 +1,297 @@
 # telegram_handlers.py
-# Long-Polling Telegram Client (nur 'requests')
+# Drop-in Telegram-Integration ohne Zusatz-Dependencies (nur requests).
+# – Buttons: Buy, Fund, Help, Alerts, Wallet, Settings, DCA Orders, Limit Orders, Refresh
+# – Befehle: /start, /help, /settings, /refresh, /set <key> <value>, /dryrun on|off,
+/autobuy on|off, /interval <sec>, /quote <SYMBOL>|off
+# – Teilt sich eine mutable CONFIG-Dict mit bot.py und kann eine on_refresh()-Callback auslösen.
+
 import os
-import json
 import time
+import json
+import logging
 import threading
+from typing import Callable, Dict, Optional, Any, List
+
 import requests
 
-TG_API_TIMEOUT = 60
+log = logging.getLogger("tg")
 
-def _j(o):
-    return json.dumps(o, ensure_ascii=False)
+# Mapping für /set aliases -> CONFIG-Keys
+SET_ALIASES = {
+    "liq": "STRAT_LIQ_MIN",
+    "fdv": "STRAT_FDV_MAX",
+    "vol5m": "STRAT_VOL5M_MIN",
+    "volbest": "STRAT_VOL_BEST_MIN",
+    "age": "MAX_AGE_MIN",              # Minuten; optional
+    "maxitems": "STRAT_MAX_ITEMS",     # wie viele Paare max. anzeigen/prüfen
+    "timeout": "HTTP_TIMEOUT",         # Sekunden HTTP-Timeout
+}
+
+HELP_TEXT = (
+    "🤖 *NeoAutoSniper – Hilfe*\n\n"
+    "*Buttons*\n"
+    "• *Refresh* – sofort scannen\n"
+    "• *Settings* – aktuelle Filter anzeigen\n"
+    "• Die restlichen Buttons sind Platzhalter (UI), Funktionen folgen.\n\n"
+    "*Befehle*\n"
+    "• `/help` – diese Hilfe\n"
+    "• `/settings` – Filter zeigen\n"
+    "• `/refresh` – sofort scannen\n"
+    "• `/set liq 130000` – Min-Liquidität setzen\n"
+    "• `/set fdv 400000` – Max-FDV setzen\n"
+    "• `/set vol5m 20000` – Min 5-Min-Volumen setzen\n"
+    "• `/set volbest 5000` – Min bestVol setzen (optional)\n"
+    "• `/set age 120` – Max Pair-Alter (Min) (optional)\n"
+    "• `/dryrun on|off` – Käufe simulieren/aktivieren\n"
+    "• `/autobuy on|off` – Auto-Kauf an/aus\n"
+    "• `/interval 60` – Scan-Intervall Sekunden\n"
+    "• `/quote SOL` – Quote auf SOL festnageln (`/quote off` zum Freigeben)\n"
+)
+
+def _mk_keyboard() -> dict:
+    # ReplyKeyboardMarkup laut Telegram Bot API
+    rows = [
+        [{"text": "Buy"}, {"text": "Fund"}],
+        [{"text": "Help"}, {"text": "Alerts"}],
+        [{"text": "Wallet"}, {"text": "Settings"}],
+        [{"text": "DCA Orders"}, {"text": "Limit Orders"}],
+        [{"text": "Refresh"}],
+    ]
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "one_time_keyboard": False,
+    }
 
 class TelegramBot:
-    """
-    Minimaler Telegram-Client mit Long-Polling.
-    - send_message(...) für Outbound
-    - poll_loop(...) um /start, /help, /status, /set, /dryrun, "Refresh" zu verarbeiten
-    """
-    def __init__(self, token: str, chat_id: int | None = None, allowed_user: int | None = None):
-        if not token:
-            raise ValueError("TELEGRAM_BOT_TOKEN fehlt.")
-        self.api = f"https://api.telegram.org/bot{token}"
-        self.chat_id = int(chat_id) if chat_id else None
-        self.allowed_user = int(allowed_user) if allowed_user else None
-        # Falls Chat-ID beim ersten Kontakt gelernt werden soll:
-        self._learn_file = "/mnt/data/telegram_chat.json"  # survives restarts in this container session
-        self._load_chat_from_disk()
-        self._offset = 0
-        self._stop = threading.Event()
+    def __init__(
+        self,
+        token: str,
+        chat_id: Optional[int] = None,
+        config: Optional[Dict[str, Any]] = None,
+        on_refresh: Optional[Callable[[], None]] = None,
+        session: Optional[requests.Session] = None,
+    ):
+        self.token = token
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id  # kann None sein; wird bei /start gesetzt
+        self.config = config if isinstance(config, dict) else {}
+        self.on_refresh = on_refresh
+        self.s = session or requests.Session()
+        self.offset = None
+        self._stop = False
+        self._keyboard = _mk_keyboard()
 
-    # ---------- persistence für auto-learn ----------
-    def _load_chat_from_disk(self):
+    # ---------- Low-level ----------
+    def _api(self, method: str, params: dict) -> dict:
+        url = f"{self.base}/{method}"
         try:
-            with open(self._learn_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                self.chat_id = self.chat_id or data.get("chat_id")
-                self.allowed_user = self.allowed_user or data.get("allowed_user")
-        except Exception:
-            pass
+            r = self.s.post(url, data=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.warning("Telegram API error %s: %s", method, e)
+            return {"ok": False, "error": str(e)}
 
-    def _save_chat_to_disk(self):
-        try:
-            with open(self._learn_file, "w", encoding="utf-8") as f:
-                json.dump({"chat_id": self.chat_id, "allowed_user": self.allowed_user}, f)
-        except Exception:
-            pass
-
-    # ---------- outbound ----------
-    def send_message(self, text: str, show_menu: bool = False, disable_web_page_preview: bool = True):
+    def send_text(self, text: str, parse_mode: Optional[str] = "Markdown") -> None:
         if not self.chat_id:
-            return  # niemand gebunden -> später nochmal probieren, sobald Chat kommt
+            return
         payload = {
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": disable_web_page_preview
+            "disable_web_page_preview": True,
+            "reply_markup": json.dumps(self._keyboard),
         }
-        if show_menu:
-            payload["reply_markup"] = _j(self._main_keyboard())
-        try:
-            requests.post(f"{self.api}/sendMessage", data=payload, timeout=10)
-        except Exception:
-            pass
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        self._api("sendMessage", payload)
 
-    def _main_keyboard(self):
-        # schlichtes Menü – anpassbar
-        return {
-            "keyboard": [
-                [{"text": "Buy"}, {"text": "Fund"}],
-                [{"text": "Help"}, {"text": "Alerts"}],
-                [{"text": "Wallet"}, {"text": "Settings"}],
-                [{"text": "DCA Orders"}, {"text": "Limit Orders"}],
-                [{"text": "Refresh"}],
-            ],
-            "resize_keyboard": True,
-            "one_time_keyboard": False
-        }
+    def send_hits(self, title: str, rows: List[str]) -> None:
+        if not self.chat_id or not rows:
+            return
+        msg = f"🎯 *{title}*\n" + "\n".join(rows)
+        self.send_text(msg)
 
-    # ---------- inbound (Long-Polling) ----------
+    # ---------- Public ----------
     def stop(self):
-        self._stop.set()
+        self._stop = True
 
-    def poll_loop(self, callbacks: dict):
-        """
-        callbacks:
-          - get_status(): str
-          - set_param(key:str, value:int|str): str  -> Rückmeldungstext
-          - set_dry_run(flag:bool): str
-          - refresh(): str|None
-        """
-        while not self._stop.is_set():
-            try:
-                r = requests.get(
-                    f"{self.api}/getUpdates",
-                    params={"timeout": 50, "offset": self._offset + 1},
-                    timeout=TG_API_TIMEOUT,
-                )
-                data = r.json() if r.ok else {}
-                for upd in data.get("result", []):
-                    self._offset = upd.get("update_id", self._offset)
-                    msg = upd.get("message") or upd.get("edited_message")
-                    if not msg:
-                        continue
-                    chat = msg.get("chat", {})
-                    chat_id = chat.get("id")
-                    text = (msg.get("text") or "").strip()
+    def poll_forever(self, announce_ready: bool = True):
+        # Optional Begrüßung, wenn Chat-ID bekannt
+        if announce_ready and self.chat_id:
+            self.send_text("🤖 *NeoAutoSniper* ist bereit.\nNutze */help* oder die Tasten unten.")
+        while not self._stop:
+            self._drain_updates()
+            time.sleep(1.0)
 
-                    # Erstkontakt: erlaubten User & chat_id lernen
-                    if self.allowed_user is None:
-                        self.allowed_user = chat_id
-                        self.chat_id = chat_id
-                        self._save_chat_to_disk()
-                        self.send_message("🔐 Chat verknüpft. Nur diese Chat-ID darf Befehle senden.", show_menu=True)
+    def _drain_updates(self):
+        params = {"timeout": 25}
+        if self.offset:
+            params["offset"] = self.offset
+        try:
+            r = self.s.get(f"{self.base}/getUpdates", params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            log.warning("getUpdates failed: %s", e)
+            return
 
-                    if chat_id != self.allowed_user:
-                        # Ignoriere fremde Chats
-                        continue
+        if not data.get("ok"):
+            return
 
-                    self.chat_id = chat_id  # sicherstellen
+        for upd in data.get("result", []):
+            self.offset = upd["update_id"] + 1
+            self._handle_update(upd)
 
-                    self._handle_text(text, callbacks)
-            except requests.RequestException:
-                time.sleep(2)
-            except Exception:
-                time.sleep(2)
+    # ---------- Handlers ----------
+    def _handle_update(self, upd: dict):
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            return
 
-    # ---------- parsing ----------
-    def _handle_text(self, text: str, cb: dict):
+        chat = msg.get("chat") or {}
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+
+        # Chat-ID festlegen, wenn noch nicht gesetzt
+        if not self.chat_id:
+            self.chat_id = chat.get("id")
+            log.info("[TG] Chat verknüpft: %s", self.chat_id)
+            self.send_text("🔐 Chat verknüpft. Nur diese Chat-ID darf Befehle senden.")
+            self.send_text("🤖 *NeoAutoSniper* ist bereit.\nNutze */help* oder die Tasten unten.")
+
         t = text.lower()
-        if t in ("/start", "start", "menu", "menü"):
-            self.send_message(
-                "🤖 <b>NeoAutoSniper</b> ist bereit.\n"
-                "Nutze /help für alle Befehle oder die Tasten unten.",
-                show_menu=True)
+
+        # Buttons (einfacher Text)
+        if t == "refresh" or t == "/refresh":
+            self._cmd_refresh()
+            return
+        if t == "help" or t == "/help":
+            self._cmd_help()
+            return
+        if t == "settings" or t == "/settings":
+            self._cmd_settings()
+            return
+        if t in ("buy", "fund", "alerts", "wallet", "dca orders", "limit orders"):
+            self.send_text("ℹ️ Diese Funktion ist aktuell als Platzhalter angelegt.")
             return
 
-        if t in ("/help", "help"):
-            self.send_message(
-                "<b>Befehle</b>\n"
-                "• /status – aktuelle Limits & Modus\n"
-                "• /set liq 130000 – Min-Liquidität setzen\n"
-                "• /set fdv 400000 – Max-FDV setzen\n"
-                "• /set vol5m 20000 – Min 5-Min-Volumen setzen\n"
-                "• /dryrun on|off – Käufe simulieren/aktivieren\n"
-                "• Refresh – sofort scannen\n",
-                show_menu=True)
+        # Slash Commands
+        if t.startswith("/start"):
+            self.send_text("🤖 *NeoAutoSniper* ist bereit.\nNutze */help* oder die Tasten unten.")
             return
-
-        if t in ("/status", "status", "settings"):
-            s = cb.get("get_status", lambda: "n/a")()
-            self.send_message(s, show_menu=True)
+        if t.startswith("/help"):
+            self._cmd_help()
             return
-
-        if t.startswith("/set "):
-            parts = t.split()
-            if len(parts) == 3:
-                key = parts[1]
-                val = parts[2]
-                resp = cb.get("set_param", lambda *_: "Unbekannter Setter.")(key, val)
-                self.send_message(resp, show_menu=False)
-                return
-            else:
-                self.send_message("❌ Format: /set <liq|fdv|vol5m> <zahl>", show_menu=False)
-                return
-
+        if t.startswith("/settings"):
+            self._cmd_settings()
+            return
+        if t.startswith("/refresh"):
+            self._cmd_refresh()
+            return
         if t.startswith("/dryrun"):
-            flag = "on" in t or "true" in t
-            resp = cb.get("set_dry_run", lambda *_: "n/a")(flag)
-            self.send_message(resp)
+            self._cmd_toggle_flag("DRY_RUN", t)
             return
-
-        if t == "refresh":
-            resp = cb.get("refresh", lambda: None)()
-            self.send_message(resp or "🔄 Scan wird ausgeführt…")
+        if t.startswith("/autobuy"):
+            self._cmd_toggle_flag("AUTO_BUY", t)
             return
-
-        # Platzhalter für die anderen Tasten:
-        if t in ("buy", "fund", "alerts", "wallet", "dca orders", "limit orders", "help"):
-            self.send_message("ℹ️ Diese Funktion ist als Platzhalter angelegt.", show_menu=True)
+        if t.startswith("/interval"):
+            self._cmd_set_simple("SCAN_INTERVAL", t, int)
+            return
+        if t.startswith("/quote"):
+            self._cmd_quote(t)
+            return
+        if t.startswith("/set"):
+            self._cmd_set(t)
             return
 
         # Fallback
-        self.send_message("❓ Befehl unbekannt. /help", show_menu=True)
+        self.send_text("❓ Unbekannter Befehl. Nutze */help*.")
+
+    # ----- command impls -----
+    def _cmd_help(self):
+        self.send_text(HELP_TEXT)
+
+    def _cmd_settings(self):
+        cfg = self.config or {}
+        lines = [
+            "*Aktuelle Filter / Settings*",
+            f"• STRATEGY = `{cfg.get('STRATEGY', 'dexscreener')}`",
+            f"• CHAIN = `{cfg.get('STRAT_CHAIN', 'solana')}`",
+            f"• QUOTE = `{cfg.get('STRAT_QUOTE', 'SOL')}` (STRICT={int(cfg.get('STRICT_QUOTE', 1))})",
+            f"• LIQ_MIN = `{cfg.get('STRAT_LIQ_MIN')}`",
+            f"• FDV_MAX = `{cfg.get('STRAT_FDV_MAX')}`",
+            f"• VOL5M_MIN = `{cfg.get('STRAT_VOL5M_MIN')}`",
+            f"• VOL_BEST_MIN = `{cfg.get('STRAT_VOL_BEST_MIN', 0)}`",
+            f"• MAX_AGE_MIN = `{cfg.get('MAX_AGE_MIN', '∞')}`",
+            f"• MAX_ITEMS = `{cfg.get('STRAT_MAX_ITEMS', 200)}`",
+            f"• HTTP_TIMEOUT = `{cfg.get('HTTP_TIMEOUT', 15)}`",
+            f"• INTERVAL = `{cfg.get('SCAN_INTERVAL', 60)}s`",
+            f"• DRY_RUN = `{int(cfg.get('DRY_RUN', 1))}`  AUTO_BUY = `{int(cfg.get('AUTO_BUY', 0))}`",
+        ]
+        self.send_text("\n".join(lines))
+
+    def _cmd_refresh(self):
+        self.send_text("🔄 Scan wird gestartet …")
+        try:
+            if callable(self.on_refresh):
+                self.on_refresh()
+        except Exception as e:
+            log.warning("on_refresh callback failed: %s", e)
+
+    def _cmd_toggle_flag(self, key: str, raw: str):
+        parts = raw.split()
+        if len(parts) < 2:
+            self.send_text(f"Nutze `/{parts[0][1:]} on|off`")
+            return
+        val = parts[1].lower() in ("on", "1", "true", "yes", "y")
+        self.config[key] = 1 if val else 0
+        self.send_text(f"✅ `{key}` = `{int(self.config[key])}` gesetzt.")
+
+    def _cmd_set_simple(self, key: str, raw: str, cast):
+        parts = raw.split()
+        if len(parts) < 2:
+            self.send_text(f"Nutze `/{parts[0][1:]} <wert>`")
+            return
+        try:
+            v = cast(parts[1])
+        except Exception:
+            self.send_text("❌ Ungültiger Wert.")
+            return
+        self.config[key] = v
+        self.send_text(f"✅ `{key}` = `{v}` gesetzt.")
+
+    def _cmd_quote(self, raw: str):
+        parts = raw.split()
+        if len(parts) < 2:
+            self.send_text("Nutze `/quote SOL` oder `/quote off`.")
+            return
+        arg = parts[1].upper()
+        if arg == "OFF":
+            self.config["STRICT_QUOTE"] = 0
+            self.send_text("✅ Quote-Filter deaktiviert.")
+        else:
+            self.config["STRICT_QUOTE"] = 1
+            self.config["STRAT_QUOTE"] = arg
+            self.send_text(f"✅ Quote-Filter aktiv: `{arg}`")
+
+    def _cmd_set(self, raw: str):
+        # /set <alias> <value>
+        parts = raw.split()
+        if len(parts) < 3:
+            self.send_text("Nutze `/set <liq|fdv|vol5m|volbest|age|maxitems|timeout> <wert>`")
+            return
+        alias = parts[1].lower()
+        key = SET_ALIASES.get(alias)
+        if not key:
+            self.send_text("❌ Unbekannter Parameter. Erlaubt: liq, fdv, vol5m, volbest, age, maxitems, timeout")
+            return
+        try:
+            val = int(float(parts[2]))
+        except Exception:
+            self.send_text("❌ Zahl erwartet.")
+            return
+        self.config[key] = val
+        self.send_text(f"✅ `{key}` = `{val}` gesetzt.")
