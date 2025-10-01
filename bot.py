@@ -1,223 +1,218 @@
-# bot.py – NeoAutoSniper (Solana focus)
-# Multi-Source Scan, relaxter Chain-Filter ("sol" in chainId),
-# optional Quote=SOL, best-of volume (m5/m15/h1), optional Max-Age-Filter.
+# bot.py — NeoAutoSniper (Railway)
+# - DexScreener-Scanner (Solana)
+# - Telegram-Menü (Background) – siehe telegram_handlers.py
+# - Settings via ENV ODER zur Laufzeit via /Settings (werden in STATE_FILE persistiert)
 
-import os
-import time
-import signal
-import traceback
-import requests
-from collections import Counter
+import os, time, json, requests, traceback
+from datetime import datetime, timezone
+from telegram_handlers import start_background_polling  # <— Telegram-Menü starten
 
-# ----------------------- Helpers -----------------------
-def _to_int_env(key: str, default: int) -> int:
-    val = os.getenv(key, str(default))
-    digits = "".join(ch for ch in str(val) if ch.isdigit() or ch == "-")
+# ---------- Helpers ----------
+def _parse_bool(v, default=False):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def _parse_int(v, default=0):
     try:
-        return int(digits) if digits not in ("", "-", None) else int(default)
-    except Exception:
-        return int(default)
-
-def _to_int(val, default=0) -> int:
-    try:
-        if val is None:
-            return default
-        if isinstance(val, (int, float)):
-            return int(val)
-        s = str(val).replace(",", "").strip()
-        digits = "".join(ch for ch in s if (ch.isdigit() or ch in ".-"))
-        return int(float(digits)) if digits not in ("", "-", ".", "-.", "") else default
-    except Exception:
+        return int(str(v).strip().replace("_","").replace(",",""))
+    except:
         return default
 
-def _get_quote_symbol(p) -> str:
-    qt = p.get("quoteToken")
-    if isinstance(qt, dict):
-        return (qt.get("symbol") or "").upper()
-    if isinstance(qt, str):
-        return qt.upper()
-    return ""
+def _env(name, default=None):
+    v = os.getenv(name)
+    return v if v is not None else default
 
-def _get_base_symbol(p) -> str:
-    bt = p.get("baseToken")
-    if isinstance(bt, dict):
-        return (bt.get("symbol") or "?").upper()
-    if isinstance(bt, str):
-        return bt.upper()
-    return "?"
+# ---------- Persistent State ----------
+STATE_FILE = _env("STATE_FILE", "/data/runtime_state.json")
 
-def _pair_id(p):
-    return p.get("pairAddress") or p.get("pairId") or p.get("url")
+DEFAULTS = {
+    "DRY_RUN": True,
+    "AUTO_BUY": False,
+    "SCAN_INTERVAL": 30,        # Sekunden
+    "HTTP_TIMEOUT": 15,
+    "STRAT_LIQ_MIN": 130000,    # USD
+    "STRAT_FDV_MAX": 400000,    # USD
+    "STRAT_VOL5M_MIN": 20000,   # USD
+    "STRAT_QUOTE": "SOL",       # SOL | USDC | ANY
+    "STRICT_QUOTE": 1,          # 1=strikt; 0=egal
+    "MAX_BUY_USD": 50,
+    "MAX_AGE_MIN": 0,           # 0 = kein Alters-Filter; sonst <= X Minuten alt
+}
 
-def _chain_of(p) -> str:
-    return (p.get("chainId") or p.get("chain") or "").lower()
-
-def _best_vol(p) -> int:
-    vol = p.get("volume") or {}
-    m5  = _to_int(vol.get("m5", 0))
-    m15 = _to_int(vol.get("m15", 0))
-    h1  = _to_int(vol.get("h1", 0))
-    return max(m5, m15, h1)
-
-def _age_minutes(p):
-    # Dexscreener liefert häufig pairCreatedAt (ms). Wenn nicht vorhanden -> None (kein Age-Filter).
-    ts = p.get("pairCreatedAt")
+def load_state():
+    s = {}
     try:
-        if ts is None:
-            return None
-        now_ms = int(time.time() * 1000)
-        age_min = max(0, (now_ms - int(ts)) // 60000)
-        return int(age_min)
-    except Exception:
-        return None
+        with open(STATE_FILE, "r") as f:
+            s = json.load(f)
+    except:
+        s = {}
+    # ENV überschreibt Defaults, State überschreibt danach ENV
+    for k, v in DEFAULTS.items():
+        s.setdefault(k, v)
 
-# ----------------------- ENV / Defaults -----------------------
-CHAIN             = os.getenv("STRAT_CHAIN", "solana").lower()
-QUOTE             = os.getenv("STRAT_QUOTE", "SOL").upper()
-STRICT_QUOTE      = os.getenv("STRICT_QUOTE", "1") == "1"     # jetzt default: nur /SOL
-ENDPOINT_FALLBACK = os.getenv("DEXS_ENDPOINT", "https://api.dexscreener.com/latest/dex/search?q=sol")
+    # ENV anwenden (falls vorhanden)
+    s["DRY_RUN"]           = _parse_bool(_env("DRY_RUN",           s["DRY_RUN"]),           True)
+    s["AUTO_BUY"]          = _parse_bool(_env("AUTO_BUY",          s["AUTO_BUY"]),          False)
+    s["SCAN_INTERVAL"]     = _parse_int(_env("SCAN_INTERVAL",      s["SCAN_INTERVAL"]),     30)
+    s["HTTP_TIMEOUT"]      = _parse_int(_env("HTTP_TIMEOUT",       s["HTTP_TIMEOUT"]),      15)
+    s["STRAT_LIQ_MIN"]     = _parse_int(_env("STRAT_LIQ_MIN",      s["STRAT_LIQ_MIN"]),     130000)
+    s["STRAT_FDV_MAX"]     = _parse_int(_env("STRAT_FDV_MAX",      s["STRAT_FDV_MAX"]),     400000)
+    s["STRAT_VOL5M_MIN"]   = _parse_int(_env("STRAT_VOL5M_MIN",    s["STRAT_VOL5M_MIN"]),   20000)
+    s["STRAT_QUOTE"]       = (_env("STRAT_QUOTE", s["STRAT_QUOTE"]) or "SOL").upper()
+    s["STRICT_QUOTE"]      = _parse_int(_env("STRICT_QUOTE",       s["STRICT_QUOTE"]),      1)
+    s["MAX_BUY_USD"]       = _parse_int(_env("MAX_BUY_USD",        s["MAX_BUY_USD"]),       50)
+    s["MAX_AGE_MIN"]       = _parse_int(_env("MAX_AGE_MIN",        s["MAX_AGE_MIN"]),       0)
+    return s
 
-SCAN_INTERVAL     = _to_int_env("SCAN_INTERVAL", 30)
-TIMEOUT           = _to_int_env("HTTP_TIMEOUT", 15)
+def apply_state_to_env(s):
+    # macht State sofort wirksam (z.B. für Strategien / Telegram)
+    for k, v in s.items():
+        os.environ[k] = str(v)
 
-LIQ_MIN           = _to_int_env("STRAT_LIQ_MIN", 130000)
-FDV_MAX           = _to_int_env("STRAT_FDV_MAX", 1000000)
-VOL_BEST_MIN      = _to_int_env("STRAT_VOL_BEST_MIN", 5000)   # best-of (m5/m15/h1)
-MAX_AGE_MIN       = _to_int_env("MAX_AGE_MIN", 240)           # 0/negativ => kein Age-Filter
+# ---------- DexScreener ----------
+DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search"
+# Wir nutzen wenige Queries pro Zyklus, um 429 zu vermeiden
+SEARCH_QUERIES = ["solana", "SOL"]  # bewusst klein halten
 
-DRY_RUN           = os.getenv("DRY_RUN", "1") == "1"
+def fetch_pairs(http_timeout):
+    pairs = {}
+    for q in SEARCH_QUERIES:
+        try:
+            r = requests.get(DEX_SEARCH, params={"q": q}, timeout=http_timeout)
+            if r.status_code != 200:
+                print(f"[SCAN] {DEX_SEARCH}?q={q} -> HTTP {r.status_code}")
+                # kleine Pause, damit wir Rate Limits nicht hart triggern
+                time.sleep(0.7)
+                continue
+            data = r.json() or {}
+            for p in data.get("pairs", []):
+                addr = p.get("pairAddress") or p.get("url") or f"{p.get('chainId')}-{p.get('baseToken',{}).get('address')}-{p.get('quoteToken',{}).get('address')}"
+                if addr not in pairs:
+                    pairs[addr] = p
+            time.sleep(0.4)  # sanfte Drosselung
+        except Exception as e:
+            print(f"[SCAN] error on query '{q}': {e}")
+    return list(pairs.values())
 
-print("NeoAutoSniper boot OK")
-print(f"Settings: chain={CHAIN} quote={QUOTE} STRICT_QUOTE={STRICT_QUOTE} "
-      f"LIQ_MIN={LIQ_MIN} FDV_MAX={FDV_MAX} VOL_BEST_MIN={VOL_BEST_MIN} MAX_AGE_MIN={MAX_AGE_MIN} DRY_RUN={DRY_RUN}")
+def _get(p, *path, default=None):
+    cur = p
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
 
-# ----------------------- Scan sources -----------------------
-SOURCES = [
-    lambda: f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN}",  # kann 404 sein, ist ok
-    lambda: "https://api.dexscreener.com/latest/dex/search?q=SOL/USDC",
-    lambda: "https://api.dexscreener.com/latest/dex/search?q=SOL/SOL",
-    lambda: "https://api.dexscreener.com/latest/dex/search?q=SOL",
-    lambda: "https://api.dexscreener.com/latest/dex/search?q=solana",
-]
-
-def _fetch_pairs(url: str):
+def to_int(x):
+    # DexScreener liefert teilweise floats für USD; wir runden ab
     try:
-        r = requests.get(url, timeout=TIMEOUT)
-        if r.status_code != 200:
-            print(f"[SCAN] {url} -> HTTP {r.status_code}")
-            return []
-        j = r.json()
-        return j.get("pairs", []) or j.get("result", []) or []
-    except Exception as e:
-        print(f"[SCAN] error on {url}: {e}")
-        return []
+        return int(float(x))
+    except:
+        return 0
 
-# ----------------------- Scanner -----------------------
-def scan_market():
+def minutes_since_ms(ms):
     try:
-        # 1) Einsammeln + Dedupe
-        all_pairs, seen = [], set()
-        raw_total = 0
-        for make_url in SOURCES:
-            url = make_url()
-            pairs = _fetch_pairs(url)
-            raw_total += len(pairs)
-            for p in pairs:
-                pid = _pair_id(p)
-                if not pid or pid in seen:
-                    continue
-                seen.add(pid)
-                all_pairs.append(p)
+        dt = datetime.fromtimestamp(ms/1000.0, tz=timezone.utc)
+        return int((datetime.now(timezone.utc) - dt).total_seconds() // 60)
+    except:
+        return 10**9
 
-        if not all_pairs and ENDPOINT_FALLBACK:
-            pairs = _fetch_pairs(ENDPOINT_FALLBACK)
-            raw_total += len(pairs)
-            for p in pairs:
-                pid = _pair_id(p)
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    all_pairs.append(p)
+# ---------- (Optional) Buy-Stub ----------
+def maybe_buy(pair, s):
+    # Platzhalter: hier würden wir z.B. Jupiter/Raydium ansteuern.
+    # Aktuell nur Log, niemals echter Buy.
+    base = _get(pair, "baseToken", "symbol", default="?")
+    quote= _get(pair, "quoteToken","symbol", default="?")
+    url  = pair.get("url","")
+    print(f"[BUY-DRY] Would buy {base}/{quote} for ~${s['MAX_BUY_USD']} – {url}")
 
-        print(f"[SCAN] collected {len(all_pairs)} unique pairs from {raw_total} raw results ({len(SOURCES)}+fallback sources)")
+# ---------- Main Loop ----------
+def main():
+    print("Starting Container")
+    s = load_state()
+    apply_state_to_env(s)
 
-        if all_pairs:
-            print("[DEBUG] first 8 raw pairs:")
-            for p in all_pairs[:8]:
-                print("  symbol:", _get_base_symbol(p),
-                      "quote:", _get_quote_symbol(p),
-                      "chain:", _chain_of(p),
-                      "liq:", (p.get("liquidity") or {}).get("usd"),
-                      "fdv:", p.get("fdv"),
-                      "bestVol:", _best_vol(p),
-                      "ageMin:", _age_minutes(p),
-                      "url:", p.get("url"))
-            counts = Counter(_chain_of(p) or "unknown" for p in all_pairs)
-            print("[DEBUG] chain distribution:", dict(counts))
+    print("NeoAutoSniper boot OK")
+    print(f"Settings: LIQ_MIN={s['STRAT_LIQ_MIN']}  FDV_MAX={s['STRAT_FDV_MAX']}  VOL5M_MIN={s['STRAT_VOL5M_MIN']}  "
+          f"QUOTE={s['STRAT_QUOTE']}  STRICT={s['STRICT_QUOTE']}  DRY_RUN={s['DRY_RUN']}")
 
-        # 2) Relaxter Chain-Filter: alles, wo chainId "sol" enthält
-        chain_only = [p for p in all_pairs if "sol" in _chain_of(p)]
-        print(f"[SCAN] after relaxed-chain filter: {len(chain_only)} pairs (contains 'sol')")
+    # Telegram-Menü im Hintergrund starten
+    start_background_polling()
 
-        # 3) Optional: nur SOL-Quote
-        if STRICT_QUOTE:
-            filtered = [p for p in chain_only if _get_quote_symbol(p) == QUOTE]
-            print(f"[SCAN] after quote filter: {len(filtered)} pairs (quote={QUOTE})")
-        else:
-            filtered = chain_only
-            print(f"[SCAN] quote filter disabled (STRICT_QUOTE=0) -> using {len(filtered)} pairs")
+    while True:
+        try:
+            print("Heartbeat: service alive (DRY_RUN may be on).")
 
-        # 4) Strategie-Filter (inkl. Max Age + best-of Volume)
-        hits = []
-        for p in filtered:
-            liq = _to_int((p.get("liquidity") or {}).get("usd", 0))
-            fdv = _to_int(p.get("fdv", 0))
-            vol_best = _best_vol(p)
-            age_min = _age_minutes(p)
+            raw = fetch_pairs(s["HTTP_TIMEOUT"])
+            total_raw = len(raw)
+            print(f"[SCAN] collected {len(set(id(x) for x in raw))} unique pairs from {total_raw} raw results (fallback sources)")
 
-            if liq < LIQ_MIN:
-                continue
-            if not (0 < fdv <= FDV_MAX):
-                continue
-            if vol_best < VOL_BEST_MIN:
-                continue
-            if MAX_AGE_MIN > 0 and age_min is not None and age_min > MAX_AGE_MIN:
-                continue
+            # --- Filter: nur Solana
+            sol = [p for p in raw if str(_get(p, "chainId", default="")).lower() == "solana"]
+            print(f"[SCAN] after relaxed-chain filter: {len(sol)} pairs (contains 'sol')")
 
-            base = _get_base_symbol(p)
-            url  = p.get("url") or ""
-            hits.append((base, _get_quote_symbol(p), liq, fdv, vol_best, age_min, url))
+            # --- Quote-Filter
+            quote = s["STRAT_QUOTE"].upper()
+            strict = int(s["STRICT_QUOTE"]) == 1
+            filtered = []
+            for p in sol:
+                qsym = (_get(p, "quoteToken", "symbol", default="") or "").upper()
+                if strict:
+                    if quote != "ANY" and qsym != quote:
+                        continue
+                # Alters-Filter
+                if s["MAX_AGE_MIN"] > 0:
+                    age_min = minutes_since_ms(_get(p, "pairCreatedAt", default=0))
+                    if age_min > s["MAX_AGE_MIN"]:
+                        continue
+                # Numerische Filter
+                liq = to_int(_get(p, "liquidity", "usd", default=0))
+                fdv = to_int(_get(p, "fdv", default=0))
+                vol5= to_int(_get(p, "volume", "m5", default=0))
+                if liq >= s["STRAT_LIQ_MIN"] and 0 < fdv <= s["STRAT_FDV_MAX"] and vol5 >= s["STRAT_VOL5M_MIN"]:
+                    filtered.append(p)
 
-        if hits:
-            hits.sort(key=lambda x: (-x[2], x[3]))  # Liq desc, FDV asc
-            print(f"[HITS] {len(hits)} match(es) (top 5):")
-            for base, q, liq, fdv, vb, age, url in hits[:5]:
-                age_txt = f"{age}m" if age is not None else "n/a"
-                print(f"  • {base}/{q} | liq ${liq:,} | fdv ${fdv:,} | vol* {vb} | age {age_txt} | {url}")
-        else:
-            print("[HITS] none matching filters")
+            # Debug-Ausgabe (Top 5 nach Liquidity)
+            filtered.sort(key=lambda p: to_int(_get(p,"liquidity","usd",default=0)), reverse=True)
+            top = filtered[:5]
 
-        if DRY_RUN:
-            print("[MODE] DRY_RUN active — no buys.")
+            # Reporting
+            if strict:
+                print(f"[SCAN] quote filter enabled (STRICT_QUOTE=1) -> using {len(filtered)} pairs")
+            else:
+                print(f"[SCAN] quote filter disabled (STRICT_QUOTE=0) -> using {len(filtered)} pairs")
 
-    except Exception as e:
-        print("[ERR] during scan:", e)
-        traceback.print_exc()
+            if not top:
+                print("[HITS] none matching filters")
+            else:
+                print(f"[HITS] {len(filtered)} match(es) (top 5):")
+                for p in top:
+                    base = _get(p, "baseToken", "symbol", default="?")
+                    quote_s = _get(p, "quoteToken", "symbol", default="?")
+                    liq  = to_int(_get(p, "liquidity","usd",default=0))
+                    fdv  = to_int(_get(p, "fdv", default=0))
+                    vol5 = to_int(_get(p, "volume","m5",default=0))
+                    ageM = minutes_since_ms(_get(p,"pairCreatedAt",default=0))
+                    url  = p.get("url","")
+                    print(f"  • {base}/{quote_s} | liq ${liq:,} | fdv ${fdv:,} | vol* {vol5:,} | age {ageM}m | {url}")
 
-# ----------------------- Main loop -----------------------
-_running = True
-def _handle_sig(sig, frame):
-    global _running
-    print(f"[signal] received {sig}, shutting down ...")
-    _running = False
+                    # Auto-Buy (noch Dry-Run / Stub)
+                    if s["AUTO_BUY"] and not s["DRY_RUN"]:
+                        maybe_buy(p, s)
 
-try:
-    signal.signal(signal.SIGTERM, _handle_sig)
-    signal.signal(signal.SIGINT, _handle_sig)
-except Exception:
-    pass
+            if s["DRY_RUN"]:
+                print("[MODE] DRY_RUN active — no buys.")
+
+        except Exception as e:
+            print("[ERROR]", e)
+            traceback.print_exc()
+
+        # Schlafen bis zum nächsten Scan
+        time.sleep(max(5, int(s["SCAN_INTERVAL"])))
+
 
 if __name__ == "__main__":
-    while _running:
-        print("Heartbeat: service alive (DRY_RUN may be on).")
-        scan_market()
-        time.sleep(SCAN_INTERVAL)
+    main()
