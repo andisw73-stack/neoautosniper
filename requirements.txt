@@ -1,10 +1,7 @@
-# Basics
 requests>=2.31.0
-python-dotenv==1.0.1
-pytz==2024.1
-simplejson==3.19.2
+python-dotenv>=1.0.1
 
-# Solana stack
-base58==2.1.1
+# Solana/Jupiter
 solana==0.30.2
-# solders NICHT pinnen – pip zieht automatisch die passende (~0.18.x)
+solders>=0.21.0
+base58>=2.1.1
